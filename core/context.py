@@ -1,15 +1,15 @@
 import numpy as np
-import ollama
 from typing import List, Dict, Optional
-from collections import deque
 import faiss
 from langchain_community.vectorstores import FAISS
 from langchain_community.docstore import InMemoryDocstore
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-local_embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
+# Use local Ollama instance for embeddings (runs on localhost:11434 by default)
+MODEL_NAME = "all-minilm:l6-v2"  # or "mistral" or other Ollama models
+local_embeddings = OllamaEmbeddings(model=MODEL_NAME)
 
 class JarvisContextManager:
 
@@ -19,23 +19,40 @@ class JarvisContextManager:
         dim = len(local_embeddings.embed_query("init"))
         index = faiss.IndexFlatL2(dim)
         self.vector_store = FAISS(
-            embedding_function=local_embeddings.embed_query,
+            embedding_function=local_embeddings,
             index=index,
             docstore=InMemoryDocstore(),
             index_to_docstore_id={}
         )
 
         self.topic_vectors = FAISS(
-            embedding_function=local_embeddings.embed_query,
+            embedding_function=local_embeddings,
             index=faiss.IndexFlatL2(dim),
             docstore=InMemoryDocstore(),
             index_to_docstore_id={}
         )
+        
+        self.session_literal_memory = {}
 
         self.current_topic = "general"
 
         # Register this instance as the singleton for tool access
         JarvisContextManager._instance = self
+    
+    def add_session_memory(self, content: str, id:str):
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+        chunks = splitter.split_text(content)
+        docs = [Document(page_content=chunk, metadata={"id": id}) for chunk in chunks]
+        print(f"[Session Memory] Added {len(docs)} chunks for ID: {id}")
+        self.session_literal_memory[id] = docs
+    
+    def get_session_memory(self, id: str) -> List[Dict]:
+        chunk = self.session_literal_memory.get(id, [])[0].page_content if id in self.session_literal_memory and len(self.session_literal_memory[id]) > 0 else None
+        self.session_literal_memory[id] = self.session_literal_memory[id][1:] if chunk else []
+        return {
+            "length": len(self.session_literal_memory.get(id, [])),
+            "chunk": chunk,
+        }
 
     def get_topic_keys(self) -> List[str]:
         return list(set(doc.metadata.get("topic") for doc in self.topic_vectors.docstore._dict.values()))
@@ -48,8 +65,10 @@ class JarvisContextManager:
         self.topic_vectors.add_documents(docs)
     
     def add_to_memory(self, content: str, topic: str):
-        doc = [Document(page_content=content, metadata={"topic": topic})]
-        self.vector_store.add_documents(doc)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=128, chunk_overlap=64)
+        chunks = splitter.split_text(content)
+        docs = [Document(page_content=chunk, metadata={"topic": topic}) for chunk in chunks]
+        self.vector_store.add_documents(docs)
 
     def query_memory(self, query: str, topic: str = "general", k: int = 5) -> List[Dict]:
         """Query the vector store by topic and semantic similarity."""
@@ -82,11 +101,15 @@ class JarvisContextManager:
             avg_competitor = np.mean(competitors)
             std_competitor = np.std(competitors)
             
-            margin = top_gravity - sorted_topics[1][1]
+            second_gravity = sorted_topics[1][1]
+            margin = top_gravity - second_gravity
+            ratio = top_gravity / (second_gravity + 1e-9)
+
             is_clear_winner = top_gravity > (avg_competitor + (1.5 * std_competitor))
-            is_distinct = margin > (sorted_topics[1][1] * 0.1)
+            is_distinct = margin > (second_gravity * 0.5)
+            is_ratio_winner = ratio >= 1.02
             
-            selected_topic = top_topic if (is_clear_winner and is_distinct) else "general"
+            selected_topic = top_topic if ((is_clear_winner and is_distinct) or is_ratio_winner) else "general"
         else:
             selected_topic = top_topic
 
@@ -149,6 +172,17 @@ if __name__ == "__main__":
                 'Utilizing in-body image stabilization allows photographers to capture sharp handheld images at slow shutter speeds previously impossible to achieve without a heavy tripod.'
             ]
         },
+        {
+            'topic': 'Violin',
+            'content': """Four stringed instrument. The violin is a cornerstone of Western classical music, with a rich repertoire spanning from Baroque to contemporary compositions. Its expressive range and technical capabilities have made it a favorite among composers and performers alike. The instrument's design, including its hollow wooden body and f-shaped sound holes, contributes to its distinctive timbre. Mastery of the violin requires years of dedicated practice to develop the necessary bowing techniques and finger dexterity.""",
+            'utterances': [
+                'Vivaldi’s Four Seasons is a quintessential example of Baroque violin music, showcasing virtuosic techniques and expressive melodies.', 
+                'Mozart’s Violin Concerto No. 5 in A major, K. 219, also known as the "Turkish" concerto, is renowned for its lively rhythms and intricate passages.', 
+                'Bach’s Partita No. 2 in D minor, BWV 1004, features the famous Chaconne, a monumental work for solo violin.', 
+                'The techniques used in Baroque violin music, such as ornamentation and basso continuo, require a deep understanding of historical performance practices.'
+            ]
+        },
+        
     ]
 
     for i in test_data:
