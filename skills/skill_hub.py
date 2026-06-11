@@ -32,6 +32,10 @@ class SkillHub:
             "agent_skills": self.agent_skills.list(),
         }
 
+    def install_mcp(self, name: str):
+        """Install an MCP server by name."""
+        self.mcp.install(name)
+
     def __repr__(self) -> str:
         return (
             f"SkillHub(\n"
@@ -43,3 +47,4 @@ class SkillHub:
 
 
 hub = SkillHub()
+
