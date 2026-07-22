@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 from typing import List, Optional, Tuple
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -35,9 +36,9 @@ class TopicManager():
         min_words: int = 5,
         chunk_size: int = 24,
         chunk_overlap: int = 12,
-        similarity_k: int = 5,
-        rank_weights: Optional[List[float]] = None,
+        similarity_k: int = 4,
         per_chunk_min_gravity: float = 1.5,
+        temperature: float = 0.6,
     ) -> Dict[str, int]:
         """
         Identify topics via chunked retrieval with dominance-ratio voting.
@@ -45,8 +46,6 @@ class TopicManager():
         Core insight: real signals dominate runner-ups by 3x+; noise queries don't.
         No baseline, no cliff detection, no qualifying floors — just dominance.
         """
-        if rank_weights is None:
-            rank_weights = [1.0, 0.8]
 
         # ---- Stage 1: Conditional chunking ----
         if len(content.split()) < min_words:
@@ -69,7 +68,6 @@ class TopicManager():
         # ---- Stage 2: Per-chunk retrieval with rank-weighted aggregation ----
         topic_gravity: Dict[str, float] = defaultdict(float)
         chunks_used = 0
-        top_n = len(rank_weights)
 
         for chunk in chunks:
             vector = self.context_manager._get_embedding(chunk)
@@ -85,42 +83,41 @@ class TopicManager():
             if not chunk_gravity:
                 continue
 
-            top_picks = sorted(chunk_gravity.items(), key=lambda x: x[1], reverse=True)[:top_n]
-
-            # Per-chunk noise gate: weak chunks don't vote at all
-            if top_picks[0][1] < per_chunk_min_gravity:
+            max_gravity = max(chunk_gravity.values())
+            if max_gravity < per_chunk_min_gravity:
                 continue
 
+            exps = {t: math.exp((g - max_gravity) / temperature)
+                    for t, g in chunk_gravity.items()}
+            z = sum(exps.values())  # partition function
+
             chunks_used += 1
-            for rank, (topic, gravity) in enumerate(top_picks):
-                topic_gravity[topic] += gravity * rank_weights[rank]
+            for topic, e in exps.items():
+                topic_gravity[topic] += (e / z) * max_gravity
         
-        
-        CHUNKS_USED_MIN = 2  # require at least 2 chunks to agree
+        CHUNKS_USED_MIN = 2
+        HIGH_CONFIDENCE_GRAVITY = 2.5  # tune from your data
+        PEER_FLOOR = 0.20            # topics above this are real peers
+        ABSOLUTE_FLOOR = 1.0         # topics must also exceed this absolute gravity
 
         if chunks_used < CHUNKS_USED_MIN and len(chunks) > 1:
-            # Multiple chunks were generated, but only one survived gating.
-            # That's a noise signature, not a topic signature.
-            return self._print_election(content, [], len(chunks), chunks_used, {})
-
+            # Trust a single chunk if it produced a strong signal
+            if not topic_gravity or max(topic_gravity.values()) < HIGH_CONFIDENCE_GRAVITY:
+                return self._print_election(content, [], len(chunks), chunks_used, {})
+            # else fall through — high-confidence single chunk is allowed to speak
         if not topic_gravity:
             return self._print_election(content, [], 0, 0, {})
 
         sorted_topics = sorted(topic_gravity.items(), key=lambda x: x[1], reverse=True)
         top_gravity = sorted_topics[0][1]
         
-        # NORMALIZE: each topic's gravity expressed as fraction of top
         normalized = [(topic, g / top_gravity) for topic, g in sorted_topics]
         
-        # Now thresholds operate in normalized space [0.0, 1.0]
-        PEER_FLOOR = 0.40         # topics above this are real peers
-        
-        # Top topic always gets full points (it's by definition 1.0)
         topic_points = {sorted_topics[0][0]: 3}
         points_remaining = 2
         
         for topic, fraction in normalized[1:]:
-            if fraction >= PEER_FLOOR:
+            if fraction >= PEER_FLOOR and topic_gravity[topic] >= ABSOLUTE_FLOOR:
                 # Real peer — award decreasing points
                 topic_points[topic] = points_remaining
                 points_remaining -= 1
