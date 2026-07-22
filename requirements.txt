@@ -1,0 +1,13 @@
+python-dotenv
+langchain
+langchain-anthropic
+langchain-community
+langchain-core
+langchain-mcp-adapters
+langchain-ollama
+langchain-text-splitters
+langgraph
+pydantic
+faiss-cpu
+numpy
+deepagents
